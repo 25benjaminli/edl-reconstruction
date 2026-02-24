@@ -1,0 +1,5 @@
+edl_reconstruction/data/
+*.pth
+*.pt
+__pycache__/
+.vscode/
