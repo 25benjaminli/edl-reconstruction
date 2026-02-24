@@ -1,75 +1,69 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
-import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider, CheckButtons
 import numpy as np
-from modules.edl import evidential_regression
-from PIL import Image
-from skimage.color import rgb2lab, lab2rgb
+from PIL import Image, ImageFilter
 import os
 import glob
-import argparse
-from modules.model import EvidentialUNet
-from modules.utils import CelebAColorizationDataset, calculate_ssim, calculate_psnr
+from skimage.color import rgb2lab, lab2rgb
+from matplotlib.widgets import Slider, CheckButtons
+import matplotlib.pyplot as plt
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from .edl import NormalInvGammaConv2d
+from .edl import evidential_regression
 
 
-def train_model(model, train_loader, num_epochs=20, lamb=0.01):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+def calculate_ssim(img1, img2):
+    if torch.is_tensor(img1):
+        img1 = img1.cpu().numpy()
+    if torch.is_tensor(img2):
+        img2 = img2.cpu().numpy()
+    img1, img2 = img1.ravel(), img2.ravel()
+    C1, C2 = (0.01) ** 2, (0.03) ** 2
+    mu1, mu2 = img1.mean(), img2.mean()
+    sigma1_sq = ((img1 - mu1) ** 2).mean()
+    sigma2_sq = ((img2 - mu2) ** 2).mean()
+    sigma12 = ((img1 - mu1) * (img2 - mu2)).mean()
+    return float(((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) /
+                 ((mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2)))
 
-    print(f"Training on {device}")
-    losses = []
-    for epoch in range(num_epochs):
-        model.train()
-        epoch_loss = 0
 
-        for batch_idx, (corrupted_img, target) in enumerate(train_loader):
-            corrupted_img, target = corrupted_img.to(device), target.to(device)
+def calculate_psnr(img1, img2):
+    if torch.is_tensor(img1):
+        img1 = img1.cpu().numpy()
+    if torch.is_tensor(img2):
+        img2 = img2.cpu().numpy()
+    mse = np.mean((img1 - img2) ** 2)
+    return float('inf') if mse == 0 else float(20 * np.log10(1.0 / np.sqrt(mse)))
 
-            optimizer.zero_grad()
-            mu, v, alpha, beta = model(corrupted_img)
 
-            # the loss should be the sum of losses per channel instead of flattening
-            channel_losses = [
-                evidential_regression(
-                    (
-                        mu[:, c].reshape(-1, 1),
-                        v[:, c].reshape(-1, 1),
-                        alpha[:, c].reshape(-1, 1),
-                        beta[:, c].reshape(-1, 1),
-                    ),
-                    target[:, c].reshape(-1, 1),
-                    lamb=lamb
-                )
-                for c in range(mu.shape[1])
-            ]
-            loss = torch.stack(channel_losses).sum()
-            losses.append(loss.item())
-            loss.backward()
-            optimizer.step()
+class CelebAColorizationDataset(Dataset):
+    """Gives L in [-1,1], ab in [-1,1]."""
 
-            epoch_loss += loss.item()
+    def __init__(self, root='./data/celeba/img_align_celeba', img_size=64, max_images=None):
+        self.image_paths = sorted(glob.glob(os.path.join(root, '*.jpg')))
+        if not self.image_paths:
+            raise RuntimeError(f"No images found in {root}.")
+        if max_images is not None:
+            self.image_paths = self.image_paths[:max_images]
+        print(f"Loaded {len(self.image_paths)} images from {root}")
+        self.transform = transforms.Compose([
+            transforms.CenterCrop(178),
+            transforms.Resize(img_size),
+        ])
 
-            if batch_idx % 50 == 0:
-                print(
-                    f"  Batch [{batch_idx}/{len(train_loader)}], Loss: {loss.item():.4f}")
+    def __len__(self):
+        return len(self.image_paths)
 
-        avg_loss = epoch_loss / len(train_loader)
-        print(f"Epoch [{epoch+1}/{num_epochs}], Avg Loss: {avg_loss:.4f}")
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(losses, label='Training Loss')
-    plt.xlabel('Iteration')
-    plt.ylabel('Loss')
-    plt.title('Training Loss Curve')
-    plt.legend()
-    plt.show()
-    return model
-
+    def __getitem__(self, idx):
+        img_pil = self.transform(Image.open(self.image_paths[idx]).convert('RGB'))
+        img_lab = transforms.ToTensor()(rgb2lab(np.array(img_pil)).astype("float32"))
+        L  = img_lab[[0], ...] / 50. - 1.
+        ab = img_lab[[1, 2], ...] / 110.
+        return L, ab
+    
 
 def visualize_results_interactive(model, dataset):
     device = next(model.parameters()).device
@@ -172,36 +166,56 @@ def visualize_results_interactive(model, dataset):
     update(0)
     plt.show()
 
+def train_model(model, train_loader, num_epochs=20, lamb=0.01):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-if __name__ == "__main__":
-    torch.manual_seed(42)
-    np.random.seed(42)
+    print(f"Training on {device}")
+    losses = []
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--eval-only', action='store_true',
-                        help='Evaluate the model without training')
-    args = parser.parse_args()
+        for batch_idx, (corrupted_img, target) in enumerate(train_loader):
+            corrupted_img, target = corrupted_img.to(device), target.to(device)
 
-    all_dataset = CelebAColorizationDataset(
-        root='./data/img_align_celeba',
-        img_size=128,
-        max_images=2500,
-    )
+            optimizer.zero_grad()
+            mu, v, alpha, beta = model(corrupted_img)
 
-    train_size = int(0.8 * len(all_dataset))
-    test_size = len(all_dataset) - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(
-        all_dataset, [train_size, test_size]
-    )
+            # the loss should be the sum of losses per channel instead of flattening
+            channel_losses = [
+                evidential_regression(
+                    (
+                        mu[:, c].reshape(-1, 1),
+                        v[:, c].reshape(-1, 1),
+                        alpha[:, c].reshape(-1, 1),
+                        beta[:, c].reshape(-1, 1),
+                    ),
+                    target[:, c].reshape(-1, 1),
+                    lamb=lamb
+                )
+                for c in range(mu.shape[1])
+            ]
+            loss = torch.stack(channel_losses).sum()
+            losses.append(loss.item())
+            loss.backward()
+            optimizer.step()
 
-    model = EvidentialUNet(in_channels=1, out_channels=2)
-    print(f"Train: {len(train_dataset)}  Test: {len(test_dataset)}")
+            epoch_loss += loss.item()
 
-    if not args.eval_only:
-        train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=2)
-        model = train_model(model, train_loader, num_epochs=20, lamb=0.01)
-        torch.save(model.state_dict(), 'evidential_celeba_model.pth')
-    else:
-        model.load_state_dict(torch.load("evidential_celeba_model.pth"))
+            if batch_idx % 50 == 0:
+                print(
+                    f"  Batch [{batch_idx}/{len(train_loader)}], Loss: {loss.item():.4f}")
 
-    visualize_results_interactive(model, test_dataset)
+        avg_loss = epoch_loss / len(train_loader)
+        print(f"Epoch [{epoch+1}/{num_epochs}], Avg Loss: {avg_loss:.4f}")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(losses, label='Training Loss')
+    plt.xlabel('Iteration')
+    plt.ylabel('Loss')
+    plt.title('Training Loss Curve')
+    plt.legend()
+    plt.show()
+    return model

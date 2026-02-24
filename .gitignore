@@ -1,4 +1,4 @@
-edl_reconstruction/data/
+data/
 *.pth
 *.pt
 __pycache__/
